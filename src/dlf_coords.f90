@@ -1476,6 +1476,17 @@ subroutine dlf_cartesian_align(nat,coords1,coords2)
   !  write(*,"('Eigval, vec a_k ',f10.3,5x,3f10.3)") eigval(i),eigvec(:,i)
   !end do
 
+  ! A (near-)degenerate eigenvalue of rsmat (e.g. the 2-D null space for a
+  ! linear molecule, such as the HCN/HNC endpoints of an NEB path) leaves
+  ! LAPACK free to return any orthonormal basis of that subspace. Which one
+  ! actually comes back can change between runs with floating-point noise
+  ! far below the clustering tolerance -- observed with MKL's dsyev under
+  ! concurrent load -- flipping the rotation built from eigvec below and
+  ! hence the aligned endpoint. Pin it down: fix each eigenvector's sign and
+  ! replace each cluster of near-equal eigenvalues by a canonical basis of
+  ! the same subspace. See dlf_align_canon_eigvec.
+  call dlf_align_canon_eigvec(3,eigval,eigvec)
+
   ! It turns out that the rotation matrix may have a determinat of -1
   ! in the procedure used here, i.e. the system is mirrored - which is
   ! wrong chemically. This can be avoided by inserting a minus in the
@@ -1540,6 +1551,184 @@ subroutine dlf_cartesian_align(nat,coords1,coords2)
     coords2(:,iat)= coords2(:,iat)+center
   end do
 end subroutine dlf_cartesian_align
+!!****
+
+! %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+!!****f* coords/dlf_align_canon_eigvec
+!!
+!! FUNCTION
+!!
+!! Make the eigenvectors dlf_matrix_diagonalise returns for the symmetric
+!! matrix in dlf_cartesian_align deterministic and continuous in the input
+!! matrix, including for a degenerate or near-degenerate eigenvalue.
+!!
+!! A (near-)degenerate eigenvalue leaves the diagonaliser free to return
+!! ANY orthonormal basis of the corresponding (near-)invariant subspace;
+!! which one it actually returns depends on floating-point noise far below
+!! the clustering tolerance used here (round-off accumulated in rmat and
+!! rsmat=transpose(rmat)*rmat, or scheduling noise inside a multi-threaded
+!! BLAS such as MKL). For a linear molecule -- e.g. the HCN/HNC endpoints
+!! of an NEB path -- the shape tensor rsmat has rank 1, so this subspace
+!! is 2-D and the noise can flip which basis comes back from one run to
+!! the next. The projector onto a clustered eigenspace, unlike the
+!! individual eigenvectors inside it, is a well-conditioned
+!! (Lipschitz-continuous) function of the input matrix as long as there
+!! is a spectral gap to the eigenvalues outside the cluster [Davis and
+!! Kahan, SIAM J. Numer. Anal. 7, 1 (1970)]. Replacing each cluster's
+!! basis by a fixed, canonical one built from that projector removes the
+!! sensitivity, without touching the (already well-conditioned)
+!! non-degenerate case beyond fixing its sign.
+!!
+!! Two independent ambiguities are removed:
+!!
+!! (a) SIGN: an eigenvector is only defined up to an overall sign. Fix it
+!!     by requiring the largest-magnitude component to be positive, ties
+!!     broken by the lowest index. This leaves dlf_cartesian_align's
+!!     result unchanged (to round-off) for a well-conditioned matrix:
+!!     every eigvec column feeds into its final rotation matrix only
+!!     through terms that are bilinear in that column (rsmat(:,k) is
+!!     itself linear in eigvec(:,k) there), so a sign flip of column k
+!!     cancels out of those terms exactly, and flipping a sign is exact
+!!     in IEEE arithmetic (no rounding).
+!!
+!! (b) BASIS WITHIN A DEGENERATE CLUSTER: eigenvalues within a tolerance
+!!     relative to the largest eigenvalue (rel_tol=1.d-8) are treated as
+!!     one cluster. 1.d-8 is well above double-precision round-off --
+!!     ~1.d-16, accumulated maybe a couple of orders of magnitude further
+!!     through the matrix products that build rsmat -- and, more to the
+!!     point, a gap this small already makes the *individual* eigenvectors
+!!     on either side of it ill-conditioned (their sensitivity to a
+!!     perturbation of the matrix scales as 1/gap), so they are not
+!!     "genuinely distinct and well-resolved" in any useful sense even
+!!     when they are not exactly equal. A deliberately-planar or -linear
+!!     molecule's cluster is degenerate to round-off (~1.d-16, see case 2
+!!     in test/align_canon); 1.d-8 additionally covers an accidentally
+!!     near-degenerate cluster whose eigenvalues were only ever known to
+!!     looser precision, such as the matrix transcribed to 8 decimal
+!!     digits in test/align_canon's case 1. It stays far below any
+!!     splitting that should be treated as physically distinct (the bent
+!!     water pair in test/align_canon's case 3 has a relative gap of
+!!     ~1.d0, for comparison). Each cluster's eigenvectors are
+!!     replaced by a canonical orthonormal basis of the *same* subspace:
+!!     project each fixed axis e_1, e_2, e_3 onto the subspace using the
+!!     cluster's projector, then run column-pivoted Gram-Schmidt on those
+!!     projections -- at each step taking the *largest-norm* remaining one
+!!     as the next basis vector, not the first one above a fixed threshold
+!!     (an early version of this routine did that, and failed its own
+!!     test: whenever e_1's projection had a norm close to the threshold,
+!!     a perturbation far below it could flip whether e_1 or e_2 was
+!!     accepted first, which is exactly the kind of discontinuity this
+!!     routine exists to remove). Because it is the projector -- not the
+!!     individual eigenvectors making it up -- that is numerically
+!!     stable, and picking the largest remaining norm only changes the
+!!     pivot order at an exact tie (non-generic), the resulting basis no
+!!     longer depends on which vectors the diagonaliser happened to
+!!     return.
+!!
+!! A non-degenerate eigenvalue is a cluster of size 1 and is left as
+!! dlf_matrix_diagonalise returned it, aside from the sign fix in (a).
+!!
+!! SYNOPSIS
+subroutine dlf_align_canon_eigvec(n,eigval,eigvec)
+!! SOURCE
+  use dlf_parameter_module, only: rk
+  implicit none
+  integer , intent(in)    :: n
+  real(rk), intent(in)    :: eigval(n)
+  real(rk), intent(inout) :: eigvec(n,n)
+  !
+  real(rk), parameter :: rel_tol = 1.D-8 ! cluster tolerance, see above
+  integer  :: clusterid(n),csize,first,i,j,k,m,imax,bestcol,nfound
+  logical  :: used(n)
+  real(rk) :: scale,proj(n,n),cols(n,n),newvec(n,n),nrm,bestnorm
+! **********************************************************************
+
+  ! --- (b) cluster the eigenvalues (dlf_matrix_diagonalise returns them
+  ! sorted ascending) by a tolerance relative to the largest one
+  scale=maxval(abs(eigval))*rel_tol
+  clusterid(1)=1
+  do i=2,n
+    if(eigval(i)-eigval(i-1) <= scale) then
+      clusterid(i)=clusterid(i-1)
+    else
+      clusterid(i)=clusterid(i-1)+1
+    end if
+  end do
+
+  i=1
+  do while(i<=n)
+    first=i
+    csize=1
+    do while(first+csize<=n)
+      if(clusterid(first+csize)/=clusterid(first)) exit
+      csize=csize+1
+    end do
+
+    if(csize>=2) then
+      ! projector onto this cluster's (near-)invariant subspace: basis
+      ! independent, hence numerically stable even though the individual
+      ! eigvec columns making it up are not
+      proj=0.D0
+      do m=first,first+csize-1
+        do k=1,n
+          do j=1,n
+            proj(k,j)=proj(k,j)+eigvec(k,m)*eigvec(j,m)
+          end do
+        end do
+      end do
+
+      ! columns of proj are e_1,e_2,...,e_n projected onto the subspace;
+      ! column-pivoted Gram-Schmidt: repeatedly take the remaining column
+      ! of largest norm, normalise it, then subtract its projection from
+      ! every other remaining column
+      cols=proj
+      used=.false.
+      nfound=0
+      do while(nfound<csize)
+        bestcol=-1
+        bestnorm=-1.D0
+        do m=1,n
+          if(used(m)) cycle
+          nrm=dot_product(cols(:,m),cols(:,m))
+          if(nrm>bestnorm) then
+            bestnorm=nrm
+            bestcol=m
+          end if
+        end do
+        ! trace(proj)=csize, so csize of the n columns have a healthy
+        ! norm; bestnorm collapsing to ~0 before csize are found would
+        ! mean the cluster was mis-detected (should not happen) -- bail
+        ! out and leave the original vectors rather than divide by ~0
+        if(bestnorm < 1.D-12) exit
+        used(bestcol)=.true.
+        nfound=nfound+1
+        newvec(:,nfound)=cols(:,bestcol)/sqrt(bestnorm)
+        do m=1,n
+          if(used(m)) cycle
+          cols(:,m)=cols(:,m)-dot_product(newvec(:,nfound),cols(:,m))*newvec(:,nfound)
+        end do
+      end do
+
+      if(nfound==csize) then
+        do m=1,csize
+          eigvec(:,first+m-1)=newvec(:,m)
+        end do
+      end if
+    end if
+
+    i=first+csize
+  end do
+
+  ! --- (a) fix the sign of every column, degenerate or not
+  do k=1,n
+    imax=1
+    do i=2,n
+      if(abs(eigvec(i,k)) > abs(eigvec(imax,k))) imax=i
+    end do
+    if(eigvec(imax,k) < 0.D0) eigvec(:,k)=-eigvec(:,k)
+  end do
+
+end subroutine dlf_align_canon_eigvec
 !!****
 
 ! %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
