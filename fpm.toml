@@ -1,0 +1,28 @@
+name = "libdlfind"
+license = "LGPL-3.0-or-later"
+description = "DL-FIND geometry optimiser as a library (terco's patched fork)"
+homepage = "https://github.com/JorgeG94/libdlfind"
+
+# The same sources as src/CMakeLists.txt: everything under src/. The pieces
+# that are not part of the library (the standalone driver, the MPI parallel
+# layer, crystal support) are in extra/, which fpm does not compile.
+# LAPACK/BLAS are linked by the consumer (terco gets them through pic-blas).
+
+[library]
+source-dir = "src"
+
+[build]
+auto-executables = false
+auto-tests = false
+auto-examples = false
+
+[preprocess]
+[preprocess.cpp]
+suffixes = ["f90"]
+
+# DL-FIND is legacy-style Fortran: external procedures without explicit
+# interfaces and implicitly typed variables. These turn off fpm's
+# -Werror=implicit-interface and -fimplicit-none for this package only.
+[fortran]
+implicit-typing = true
+implicit-external = true

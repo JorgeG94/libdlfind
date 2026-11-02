@@ -30,8 +30,9 @@ list(
   ${dir}/dlf_task.f90
   ${dir}/dlf_time.f90
   ${dir}/dlf_util.f90
-# ${dir}/draw.f90
-# ${dir}/main.f90
+# draw.f90 and main.f90 (the standalone driver), dlf_mpi.f90 (the MPI
+# replacement for dlf_serial.f90) and dlfind_crystal.f90 live in extra/:
+# they are not part of the library, and fpm compiles everything under src/.
   ${dir}/mod_api.f90 # Added for libdlfind
   ${dir}/mod_globals.f90 # Added for libdlfind
 )
