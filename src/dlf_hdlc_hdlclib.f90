@@ -1961,7 +1961,8 @@ CONTAINS
     REAL (rk), PARAMETER :: cutoff = 1.0D-8
 
 ! local vars
-    INTEGER :: i, idum, j
+    INTEGER :: i, idum, j, pass
+    REAL (rk) :: overlap, rownorm
     REAL (rk), DIMENSION (:), ALLOCATABLE :: temp
     TYPE (matrix) :: g_mat, btprim, r_mat, v_mat, bv_mat
 
@@ -2017,6 +2018,24 @@ CONTAINS
     ut = matrix_create(n6,nii,'Ut matrix')
     DO i = 1, n6
       ut%data(i,:) = bv_mat%data(:,i)/sqrt(temp(i))
+    END DO
+
+! B v / sqrt(lambda) loses orthogonality as lambda approaches the cutoff, by
+! about eps |B|^2 / lambda, where diagonalising B Bt directly did not. Two
+! passes of modified Gram-Schmidt in order of decreasing eigenvalue restore
+! it and leave rows that were already orthonormal unchanged to round-off.
+    DO pass = 1, 2
+      DO i = 1, n6
+        DO j = 1, i - 1
+          overlap = dot_product(ut%data(j,:),ut%data(i,:))
+          ut%data(i,:) = ut%data(i,:) - overlap*ut%data(j,:)
+        END DO
+        rownorm = sqrt(dot_product(ut%data(i,:),ut%data(i,:)))
+        IF (rownorm<=0.0D0) THEN
+          CALL hdlc_errflag('A delocalised coordinate has zero norm','stop')
+        END IF
+        ut%data(i,:) = ut%data(i,:)/rownorm
+      END DO
     END DO
 
 ! clean up
