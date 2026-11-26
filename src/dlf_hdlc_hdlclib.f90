@@ -1840,6 +1840,16 @@ CONTAINS
       CALL hdlc_errflag('Insufficient primitive coordinates','abort')
     END IF
 
+! More primitives than Cartesians: G = B Bt is nii x nii and has at most n
+! non-zero eigenvalues, so its eigenvectors are taken from Bt B, which is n x n.
+! A cage with high coordination has tens of thousands of primitives (a Keggin
+! anion, 67 atoms: 22565), where the large matrix is gigabytes and its
+! diagonalisation hours.
+    IF (nii>n) THEN
+      CALL hdlc_make_ut_small(ut,bprim,nii,n,n6)
+      RETURN
+    END IF
+
 ! allocate space
     g_mat = matrix_create(nii,nii,'G matrix')
     btprim = matrix_create(nii,n,'Bt matrix')
@@ -1914,6 +1924,129 @@ CONTAINS
 ! end
     RETURN
   END SUBROUTINE hdlc_make_ut
+
+!//////////////////////////////////////////////////////////////////////////////
+! subroutine hdlc_make_ut_small
+!
+! The Ut matrix of hdlc_make_ut, from the n x n matrix Bt B instead of the
+! nii x nii matrix B Bt
+!
+! If Bt B v = lambda v with lambda > 0, then u = B v / sqrt(lambda) is a
+! normalised eigenvector of B Bt with the same eigenvalue, and every other
+! eigenvalue of B Bt is zero. The rows of Ut are those u for the n6 largest
+! eigenvalues, as in hdlc_make_ut. They span the same space; within a
+! degenerate eigenvalue, and in overall sign, they are a different choice of
+! basis, which the delocalised coordinates are free in.
+!
+! Input
+! =====
+! bprim : primitive B matrix (nii, n)
+! nii   : number of primitives
+! n     : number of Cartesians
+! n6    : number of delocalised coordinates
+!
+! Output
+! ======
+! ut    : Ut matrix (n6, nii)
+!
+!//////////////////////////////////////////////////////////////////////////////
+
+  SUBROUTINE hdlc_make_ut_small(ut,bprim,nii,n,n6)
+    IMPLICIT NONE
+! args
+    TYPE (matrix) :: bprim, ut
+    INTEGER, INTENT (IN) :: nii, n, n6
+
+! local params
+    REAL (rk), PARAMETER :: cutoff = 1.0D-8
+
+! local vars
+    INTEGER :: i, idum, j, pass
+    REAL (rk) :: overlap, rownorm
+    REAL (rk), DIMENSION (:), ALLOCATABLE :: temp
+    TYPE (matrix) :: g_mat, btprim, r_mat, v_mat, bv_mat
+
+! form Bt B
+    g_mat = matrix_create(n,n,'G matrix')
+    btprim = matrix_create(nii,n,'Bt matrix')
+    idum = matrix_copy(bprim,btprim)
+    idum = matrix_transpose(btprim)
+    idum = matrix_multiply(1.0D0,btprim,bprim,0.0D0,g_mat)
+    idum = matrix_destroy(btprim)
+
+! diagonalise, largest eigenvalue first
+    r_mat = matrix_create(n,n,'R vectors')
+    v_mat = matrix_create(n,1,'R roots ')
+    idum = matrix_diagonalise(g_mat,r_mat,v_mat,.FALSE.)
+    IF (idum/=0) THEN
+      CALL hdlc_errflag('G matrix could not be diagonalised','stop')
+    END IF
+    idum = matrix_destroy(g_mat)
+
+! check for faulty eigenvalue structure; the nii - n eigenvalues of B Bt that
+! are not listed are zero
+    call allocate (temp,n)
+    idum = matrix_get(v_mat,n,temp)
+    IF (printl>=6) WRITE (stdout,'(5x,a,/)') &
+      'Eigenvalue structure of primitive G matrix'
+    j = 0
+    DO i = 1, n
+      IF (printl>=6) WRITE (stdout,'(5x,a,i5,a,f13.8)') 'Eigenvalue ', i, &
+        ' = ', temp(i)
+      IF (abs(temp(i))>cutoff) j = j + 1
+    END DO
+    IF (printl>=5) WRITE (stdout,'(/,5x,a,i5,a,i5,a,/)') &
+      'The system has ', n6, ' degrees of freedom, and ', j, &
+      ' non-zero eigenvalues'
+    IF (j<n6) THEN
+      WRITE (stdout,'(/,5x,a,i5,a,i5,a,/)') &
+          'The system has ', n6, ' degrees of freedom, and ', j, &
+          ' non-zero eigenvalues'
+      IF (hdlc%ngroups==1 .AND. hdlc%internal .AND. hdlc%contyp==1) THEN
+        CALL hdlc_errflag( &
+          'DLC based on total connection cannot be used for a planar system', &
+          'stop')
+      ELSE
+        CALL hdlc_errflag( &
+          'Too few delocalised coordinates with non-zero values','stop')
+      END IF
+    END IF
+
+! B v for every eigenvector, then the n6 leading ones, normalised, as rows
+    bv_mat = matrix_create(nii,n,'B V matrix')
+    idum = matrix_multiply(1.0D0,bprim,r_mat,0.0D0,bv_mat)
+    ut = matrix_create(n6,nii,'Ut matrix')
+    DO i = 1, n6
+      ut%data(i,:) = bv_mat%data(:,i)/sqrt(temp(i))
+    END DO
+
+! B v / sqrt(lambda) loses orthogonality as lambda approaches the cutoff, by
+! about eps |B|^2 / lambda, where diagonalising B Bt directly did not. Two
+! passes of modified Gram-Schmidt in order of decreasing eigenvalue restore
+! it and leave rows that were already orthonormal unchanged to round-off.
+    DO pass = 1, 2
+      DO i = 1, n6
+        DO j = 1, i - 1
+          overlap = dot_product(ut%data(j,:),ut%data(i,:))
+          ut%data(i,:) = ut%data(i,:) - overlap*ut%data(j,:)
+        END DO
+        rownorm = sqrt(dot_product(ut%data(i,:),ut%data(i,:)))
+        IF (rownorm<=0.0D0) THEN
+          CALL hdlc_errflag('A delocalised coordinate has zero norm','stop')
+        END IF
+        ut%data(i,:) = ut%data(i,:)/rownorm
+      END DO
+    END DO
+
+! clean up
+    idum = matrix_destroy(bv_mat)
+    idum = matrix_destroy(v_mat)
+    idum = matrix_destroy(r_mat)
+    call deallocate (temp)
+
+    IF (printl>=6) idum = matrix_print(ut)
+
+  END SUBROUTINE hdlc_make_ut_small
 
 !//////////////////////////////////////////////////////////////////////////////
 ! subroutine hdlc_make_bhdlc
